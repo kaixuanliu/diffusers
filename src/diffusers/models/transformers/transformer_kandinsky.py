@@ -165,11 +165,22 @@ class Kandinsky5TimeEmbeddings(nn.Module):
         self.activation = nn.SiLU()
         self.out_layer = nn.Linear(time_dim, time_dim, bias=True)
 
-    @torch.autocast(device_type="cuda", dtype=torch.float32)
     def forward(self, time):
-        args = torch.outer(time, self.freqs.to(device=time.device))
-        time_embed = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-        time_embed = self.out_layer(self.activation(self.in_layer(time_embed)))
+        device_type = time.device.type
+
+        if device_type == "cuda":
+            # For CUDA, use float32 autocast for numerical stability
+            with torch.autocast(device_type="cuda", dtype=torch.float32):
+                args = torch.outer(time, self.freqs.to(device=time.device))
+                time_embed = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+                time_embed = self.out_layer(self.activation(self.in_layer(time_embed)))
+        else:
+            # For other devices like XPU, autocast doesn't support float32
+            dtype = self.in_layer.weight.dtype
+            args = torch.outer(time, self.freqs.to(device=time.device, dtype=dtype))
+            time_embed = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+            time_embed = self.out_layer(self.activation(self.in_layer(time_embed)))
+
         return time_embed
 
 
@@ -269,9 +280,16 @@ class Kandinsky5Modulation(nn.Module):
         self.out_layer.weight.data.zero_()
         self.out_layer.bias.data.zero_()
 
-    @torch.autocast(device_type="cuda", dtype=torch.float32)
     def forward(self, x):
-        return self.out_layer(self.activation(x))
+        device_type = x.device.type
+
+        if device_type == "cuda":
+            # For CUDA, use float32 autocast for numerical stability
+            with torch.autocast(device_type="cuda", dtype=torch.float32):
+                return self.out_layer(self.activation(x))
+        else:
+            # For other devices like XPU, autocast doesn't support float32
+            return self.out_layer(self.activation(x))
 
 
 class Kandinsky5AttnProcessor:
