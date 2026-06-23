@@ -317,7 +317,7 @@ class LTX2Pipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixin):
         text_input_ids = text_input_ids.to(device)
         prompt_attention_mask = prompt_attention_mask.to(device)
 
-        text_encoder_outputs = self.text_encoder(
+        text_encoder_outputs = self.text_encoder.model(
             input_ids=text_input_ids, attention_mask=prompt_attention_mask, output_hidden_states=True
         )
         text_encoder_hidden_states = text_encoder_outputs.hidden_states
@@ -1048,6 +1048,13 @@ class LTX2Pipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixin):
             batch_size = prompt_embeds.shape[0]
 
         device = self._execution_device
+        # Use the transformer's actual execution device for denoising tensors.
+        # Under device_map="balanced" the transformer may land on CPU while
+        # _execution_device reports an XPU, causing mixed-device matmul errors.
+        if hasattr(self.transformer, "_hf_hook") and hasattr(self.transformer._hf_hook, "execution_device"):
+            denoise_device = self.transformer._hf_hook.execution_device
+        else:
+            denoise_device = next(self.transformer.parameters()).device
 
         # 3. Prepare text embeddings
         if system_prompt is not None and prompt is not None:
@@ -1088,6 +1095,11 @@ class LTX2Pipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixin):
         connector_prompt_embeds, connector_audio_prompt_embeds, connector_attention_mask = self.connectors(
             prompt_embeds, prompt_attention_mask, padding_side=tokenizer_padding_side
         )
+        # Align connector outputs to the transformer's device
+        connector_prompt_embeds = connector_prompt_embeds.to(denoise_device)
+        if connector_audio_prompt_embeds is not None:
+            connector_audio_prompt_embeds = connector_audio_prompt_embeds.to(denoise_device)
+        connector_attention_mask = connector_attention_mask.to(denoise_device)
 
         # 4. Prepare latent variables
         latent_num_frames = (num_frames - 1) // self.vae_temporal_compression_ratio + 1
@@ -1119,7 +1131,7 @@ class LTX2Pipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixin):
             num_frames,
             noise_scale,
             torch.float32,
-            device,
+            denoise_device,
             generator,
             latents,
         )
@@ -1157,7 +1169,7 @@ class LTX2Pipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixin):
             num_mel_bins=num_mel_bins,
             noise_scale=noise_scale,
             dtype=torch.float32,
-            device=device,
+            device=denoise_device,
             generator=generator,
             latents=audio_latents,
         )
@@ -1176,7 +1188,7 @@ class LTX2Pipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixin):
         _, _ = retrieve_timesteps(
             audio_scheduler,
             num_inference_steps,
-            device,
+            denoise_device,
             timesteps,
             sigmas=sigmas,
             mu=mu,
@@ -1184,7 +1196,7 @@ class LTX2Pipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixin):
         timesteps, num_inference_steps = retrieve_timesteps(
             self.scheduler,
             num_inference_steps,
-            device,
+            denoise_device,
             timesteps,
             sigmas=sigmas,
             mu=mu,

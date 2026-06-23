@@ -335,8 +335,10 @@ class Flux2Pipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         input_ids = inputs["input_ids"].to(device)
         attention_mask = inputs["attention_mask"].to(device)
 
-        # Forward pass through the model
-        output = text_encoder(
+        # Forward pass through the model (call .model() to bypass unused lm_head,
+        # which avoids mixed-device matmul errors when the model is offloaded to CPU
+        # under device_map="balanced" while denoising tensors are on XPU)
+        output = text_encoder.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             output_hidden_states=True,
@@ -864,6 +866,13 @@ class Flux2Pipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
             batch_size = prompt_embeds.shape[0]
 
         device = self._execution_device
+        # Use the transformer's actual execution device for denoising tensors.
+        # Under device_map="balanced" the transformer may land on CPU while
+        # _execution_device reports an XPU, causing mixed-device matmul errors.
+        if hasattr(self.transformer, "_hf_hook") and hasattr(self.transformer._hf_hook, "execution_device"):
+            denoise_device = self.transformer._hf_hook.execution_device
+        else:
+            denoise_device = next(self.transformer.parameters()).device
 
         # 3. prepare text embeddings
         if caption_upsample_temperature:
@@ -914,7 +923,7 @@ class Flux2Pipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
             height=height,
             width=width,
             dtype=prompt_embeds.dtype,
-            device=device,
+            device=denoise_device,
             generator=generator,
             latents=latents,
         )
@@ -939,15 +948,23 @@ class Flux2Pipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         timesteps, num_inference_steps = retrieve_timesteps(
             self.scheduler,
             num_inference_steps,
-            device,
+            denoise_device,
             sigmas=sigmas,
             mu=mu,
         )
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
         self._num_timesteps = len(timesteps)
 
+        # Align prompt tensors to the transformer device before the denoising loop
+        prompt_embeds = prompt_embeds.to(denoise_device)
+        text_ids = text_ids.to(denoise_device)
+        if image_latents is not None:
+            image_latents = image_latents.to(denoise_device)
+        if image_latent_ids is not None:
+            image_latent_ids = image_latent_ids.to(denoise_device)
+
         # handle guidance
-        guidance = torch.full([1], guidance_scale, device=device, dtype=torch.float32)
+        guidance = torch.full([1], guidance_scale, device=denoise_device, dtype=torch.float32)
         guidance = guidance.expand(latents.shape[0])
 
         # 7. Denoising loop
